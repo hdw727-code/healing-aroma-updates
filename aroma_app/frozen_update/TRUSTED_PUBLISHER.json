@@ -1,0 +1,6 @@
+{
+  "algorithm": "ecdsa-p256-sha256-p1363",
+  "public_key_format": "sec1-uncompressed-p256",
+  "public_key_b64": "BBgn8fkd7z/1+wGpx/p7gJAEQjeTRV2nwZT0l1q0IryqPEKMyqb/Zss6MmAzaYkugOKjLhwFEGZHPxdGnjDl45I=",
+  "fingerprint_sha256": "d46122579c50f43525528d2d69902b73be6c3aa8b0fa4d0a3f59ef1d98a27486"
+}

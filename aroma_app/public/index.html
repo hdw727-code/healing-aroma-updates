@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <meta name="description" content="자료를 찾고 견적과 수업 계획을 차근차근 작성하는 로컬 업무 도우미">
+  <title>아로마 업무 · 쉬운 업무 도우미</title>
+  <link rel="stylesheet" href="/styles.css">
+  <script defer src="/promo_png.js"></script>
+  <script defer src="/native_review.js"></script>
+  <script defer src="/full_backup_ui.js"></script>
+  <script defer src="/update_ui.js"></script>
+  <script defer src="/image_ui.js"></script>
+  <script defer src="/app.js"></script>
+</head>
+<body>
+  <a class="skip-link" href="#main">본문으로 바로 가기</a>
+  <div class="app-shell">
+    <header class="app-header">
+      <button class="brand" id="brand-home" aria-label="아로마 업무 처음 화면으로">
+        <span class="brand-mark" aria-hidden="true">✿</span>
+        <span><strong>아로마 업무</strong><small>쉬운 업무 도우미</small></span>
+      </button>
+      <div class="header-status"><span id="server-status" class="status-chip">앱 준비 중</span><span class="mode-chip">서식으로 작성</span></div>
+    </header>
+    <div class="app-body">
+      <nav class="side-nav" aria-label="작업 메뉴">
+        <button data-nav="home" class="nav-btn active"><span aria-hidden="true">⌂</span> 처음 화면</button>
+        <button data-nav="quote" class="nav-btn"><span aria-hidden="true">₩</span> 견적서 만들기</button>
+        <button data-nav="plan" class="nav-btn"><span aria-hidden="true">▤</span> 수업 계획 만들기</button>
+        <button data-nav="materials" class="nav-btn"><span aria-hidden="true">⌕</span> 자료 찾기</button>
+        <button data-nav="saved" class="nav-btn"><span aria-hidden="true">▣</span> 저장한 작업</button>
+        <button data-nav="help" class="nav-btn"><span aria-hidden="true">?</span> 사용 도움말</button>
+        <button data-nav="settings" class="nav-btn"><span aria-hidden="true">⚙</span> 연결·관리</button>
+        <p class="nav-note">이 컴퓨터에 저장합니다.<br>AI와 외부 서버는 아직 연결하지 않았습니다.</p>
+      </nav>
+      <main id="main" tabindex="-1" aria-busy="true">
+        <div class="loading-card"><h1>앱을 준비하고 있어요</h1><p>이 컴퓨터의 저장된 작업을 불러옵니다.</p><span class="spinner" aria-hidden="true"></span></div>
+      </main>
+    </div>
+    <footer class="app-footer"><span>원본 자료는 바꾸지 않습니다.</span><span id="version-label">로컬 업무 도우미</span></footer>
+  </div>
+  <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+  <dialog id="message-dialog" aria-labelledby="dialog-title"><div class="dialog-body"><h2 id="dialog-title"></h2><div id="dialog-content"></div><div id="dialog-actions" class="button-row"></div></div></dialog>
+  <noscript><p class="noscript">이 앱의 화면을 표시하려면 브라우저의 JavaScript 기능이 필요합니다. 설치 안내의 실행 방법으로 다시 열어 주세요.</p></noscript>
+</body>
+</html>
