@@ -1,6 +1,6 @@
-# 아로마 업무 · 1.0.0 처음 설정하기
+# 아로마 업무 · 1.0.1 처음 설정하기
 
-1.0.0용 첫 설정 안내입니다. 설치 파일의 버전·공식 배포 안내를 확인합니다. 컴퓨터마다 설치·본인 로그인·출력·백업 준비를 별도로 확인해야 합니다. 일반 사용은 [MOTHER_GUIDE.html](MOTHER_GUIDE.html), 운영·복구는 [SON_GUIDE.md](SON_GUIDE.md), 전체 안내는 [README.md](README.md), 시작 화면은 [START_HERE.html](START_HERE.html)을 확인합니다.
+1.0.1용 첫 설정 안내입니다. 설치 파일의 버전·공식 배포 안내를 확인합니다. 컴퓨터마다 설치·본인 로그인·출력·백업 준비를 별도로 확인해야 합니다. 일반 사용은 [MOTHER_GUIDE.html](MOTHER_GUIDE.html), 운영·복구는 [SON_GUIDE.md](SON_GUIDE.md), 전체 안내는 [README.md](README.md), 시작 화면은 [START_HERE.html](START_HERE.html)을 확인합니다.
 
 ## 컴퓨터와 첫 실행
 

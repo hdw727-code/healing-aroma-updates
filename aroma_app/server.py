@@ -32,7 +32,7 @@ from whole_backup import WholeBackupError
 
 APP_ROOT = Path(__file__).resolve().parent
 SCHEMA_VERSION = 1
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.0.1"
 MAX_BODY = 2 * 1024 * 1024
 MAX_MONEY = 1_000_000_000
 

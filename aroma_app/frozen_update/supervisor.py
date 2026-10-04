@@ -72,7 +72,23 @@ class StableSupervisor:
     def initialize(self, code_dir, data_dir, *, content_dir=None, private_root=None):
         if (self.root/'initial_slot.json').exists() or (self.updater and self.updater.state_path.exists()):
             raise SupervisorError('already_initialized','Use resume for the existing installation.',409)
-        slot={"code_dir":str(Path(code_dir).resolve()),"data_dir":str(Path(data_dir).resolve()),
+        # The first public install has no user_data yet. This trusted launcher
+        # path must be created before updater state is initialized, while linked
+        # ancestors are rejected before canonicalization or any app DB write.
+        initial_data = Path(os.path.abspath(data_dir))
+        try:
+            for phase in range(2):
+                for probe in (initial_data, *initial_data.parents):
+                    if probe.is_symlink() or probe.is_junction():
+                        raise SupervisorError("initial_data_link", "Initial data path must not contain links.")
+                if phase == 0:
+                    initial_data.mkdir(parents=True, exist_ok=True)
+            if not initial_data.is_dir():
+                raise SupervisorError("initial_data_path", "Initial data directory is unavailable.")
+            initial_data = initial_data.resolve(strict=True)
+        except OSError:
+            raise SupervisorError("initial_data_path", "Initial data directory could not be prepared.") from None
+        slot={"code_dir":str(Path(code_dir).resolve()),"data_dir":str(initial_data),
               "schema_version":1,"sequence":0,"release_id":"initial"}
         if content_dir is not None:slot["local_content_dir"]=str(Path(content_dir).resolve())
         if private_root is not None:slot["local_config_dir"]=os.path.abspath(private_root) # No profile probe/read.
