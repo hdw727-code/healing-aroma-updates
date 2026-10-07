@@ -146,6 +146,12 @@ public static class AromaInstallNative {
         $scan.catalog_programs -ne 0 -or $scan.file_index_items -ne 0) {
         throw '공개 설치 자료 검증 표시가 올바르지 않습니다. 검증된 ZIP을 다시 받으세요.'
     }
+    $versionPath = Join-Path $appSource 'VERSION.json'
+    [void][AromaInstallNative]::HashChecked($versionPath)
+    $releaseVersion = Get-Content -LiteralPath $versionPath -Raw -Encoding UTF8 | ConvertFrom-Json
+    if ($releaseVersion.version -ne '1.1.0' -or $releaseVersion.schema_version -ne 2) {
+        throw '1.1.0 설치 자료의 버전 표시가 올바르지 않습니다.'
+    }
     $expected = @{}
     foreach ($record in $manifest.files) {
         $name = [string]$record.path
@@ -191,7 +197,7 @@ public static class AromaInstallNative {
     } else {
         $userLocal = [Environment]::GetFolderPath('LocalApplicationData')
         if (-not $userLocal) { throw '현재 사용자의 설치 폴더를 확인할 수 없습니다.' }
-        $installTarget = [IO.Path]::GetFullPath((Join-Path $userLocal 'HealingAromaWork'))
+        $installTarget = [IO.Path]::GetFullPath((Join-Path $userLocal 'HealingAromaWork_1_1_0'))
     }
     if (-not [IO.Path]::IsPathRooted($installTarget) -or $installTarget -eq [IO.Path]::GetPathRoot($installTarget).TrimEnd('\') -or
         $installTarget.Substring(2).Contains(':') -or $installTarget -match '[. ](\\|$)' -or
@@ -248,7 +254,7 @@ public static class AromaInstallNative {
     if (-not $SkipShortcut) {
         try {
             $desktop = [Environment]::GetFolderPath('Desktop')
-            $shortcutPath = Join-Path $desktop '아로마 업무 도우미.lnk'
+            $shortcutPath = Join-Path $desktop '아로마 업무 도우미 1.1.lnk'
             Assert-NoReparse $desktop
             if (Test-Path -LiteralPath $shortcutPath) {
                 Write-Host '바탕화면 바로가기가 이미 있어 그대로 보존했습니다.'
@@ -257,10 +263,10 @@ public static class AromaInstallNative {
                 $shortcut = $shell.CreateShortcut($shortcutPath)
                 $shortcut.TargetPath = Join-Path $resolvedTarget 'aroma_app\START_APP.cmd'
                 $shortcut.WorkingDirectory = Join-Path $resolvedTarget 'aroma_app'
-                $shortcut.Description = '아로마 업무 도우미'
+                $shortcut.Description = '아로마 업무 도우미 1.1.0'
                 $shortcut.Save()
                 [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($shell)
-                Write-Host '바탕화면의 아로마 업무 도우미를 실행하세요.'
+                Write-Host '바탕화면의 아로마 업무 도우미 1.1을 실행하세요.'
             }
         } catch {
             Write-Host '바로가기는 만들지 못했습니다. 앱 폴더의 aroma_app\START_APP.cmd를 실행하세요.'

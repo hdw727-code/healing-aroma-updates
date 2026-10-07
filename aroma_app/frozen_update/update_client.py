@@ -37,11 +37,13 @@ ROOT_CODE = frozenset({"server.py", "local_import.py", "ai_jobs.py", "codex_brid
     "START_APP.cmd", "시작하기.cmd"})
 CONTENT_FILES = frozenset({"content/catalog.json", "content/files.json", "content/templates.json"})
 PRIVATE_PARTS = frozenset({"user_data", "local_private", "imports", "ai_jobs", "exports", "backups",
-    "credentials", "auth", ".git", ".codex", ".aws", ".env", "sdk_probe"})
+    "credentials", "auth", ".git", ".codex", ".aws", ".env", "sdk_probe",
+    "frozen_update", "startup_update_trusted"})
 FORBIDDEN_SUFFIX = frozenset({".sqlite", ".sqlite3", ".db", ".pem", ".key", ".pfx", ".p12", ".hwp",
     ".hwpx", ".pdf", ".docx", ".pptx", ".xlsx", ".xls", ".csv", ".zip"})
 HEX64 = re.compile(r"[0-9a-f]{64}\Z")
 RELEASE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
+STABLE_VERSION = re.compile(r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\Z")
 
 
 class UpdateError(ValueError):
@@ -52,6 +54,18 @@ class UpdateError(ValueError):
 
 def fail(code, message):
     raise UpdateError(code, message)
+
+
+def version_tuple(value):
+    match = STABLE_VERSION.fullmatch(value) if isinstance(value, str) and len(value) <= 64 else None
+    if not match:
+        fail("release_version", "A stable numeric release version is required.")
+    return tuple(map(int, match.groups()))
+
+
+def require_newer_version(version, current_version):
+    if version_tuple(version) <= version_tuple(current_version):
+        fail("release_version_not_newer", "The signed version must be newer than the active app.")
 
 
 def canonical(value):
@@ -168,7 +182,7 @@ class ManifestVerifier:
         self.verifier = CNGVerifier(pinned_public_key)
         self.policy = policy or PayloadPolicy()
 
-    def verify(self, envelope_data, *, current_sequence, current_schema, now=None):
+    def verify(self, envelope_data, *, current_sequence, current_schema, now=None, current_version=None):
         if not isinstance(envelope_data, bytes) or len(envelope_data) > MAX_MANIFEST_BYTES:
             fail("manifest_size", "배포 목록이 너무 큽니다.")
         envelope = read_json(envelope_data)
@@ -198,6 +212,8 @@ class ManifestVerifier:
             fail("release_id", "배포 이름이 잘못되었습니다.")
         if not isinstance(doc["version"], str) or len(doc["version"]) > 64 or not doc["version"]:
             fail("release_version", "배포 버전이 잘못되었습니다.")
+        if current_version is not None:
+            require_newer_version(doc["version"], current_version)
         clock = int(time.time()) if now is None else int(now)
         if not integer(doc["published_at"]) or not integer(doc["expires_at"]) or not (
                 doc["published_at"] <= clock + 300 < doc["expires_at"] + 300) or doc["expires_at"] <= clock:
@@ -472,14 +488,17 @@ class SideBySideUpdater:
         self.journal_path = self.root / "transaction.json"
         self.lock = threading.Lock()
 
-    def initialize(self, *, code_dir, data_dir, sequence=0, schema_version=1):
+    def initialize(self, *, code_dir, data_dir, sequence=0, schema_version=1, version=None):
         if self.state_path.exists():
             fail("already_initialized", "실행 버전 정보가 이미 있습니다.")
         code, data = Path(code_dir).resolve(), Path(data_dir).resolve()
         if not code.is_dir() or not data.is_dir() or code == data:
             fail("initial_paths", "기존 앱과 자료 경로를 확인해야 합니다.")
+        if version is not None:
+            version_tuple(version)
         atomic_json(self.state_path, {"app_id": APP_ID, "active": {"code_dir": str(code), "data_dir": str(data),
-                    "sequence": sequence, "schema_version": schema_version, "release_id": "initial"},
+                    "sequence": sequence, "schema_version": schema_version, "release_id": "initial",
+                    **({"version": version} if version is not None else {})},
                     "highest_accepted_sequence": sequence})
 
     def status(self):
@@ -505,7 +524,7 @@ class SideBySideUpdater:
             if self.journal_path.exists() and read_json(self.journal_path.read_bytes()).get("phase") not in ("committed", "rolled_back", "aborted"):
                 fail("recovery_required", "중단된 업데이트를 먼저 복구해야 합니다.")
             verified = self.verifier.verify(envelope, current_sequence=state["highest_accepted_sequence"],
-                                            current_schema=old["schema_version"])
+                                            current_schema=old["schema_version"], current_version=old.get("version"))
             if self.lifecycle.authorize(ticket, verified["manifest_sha256"]) is not True:
                 fail("admin_required", "관리자 PIN 확인 후 직접 적용해야 합니다.")
             attempt = uuid.uuid4().hex
@@ -516,6 +535,7 @@ class SideBySideUpdater:
             transaction = {"attempt_id": attempt, "phase": "verified", "old": old,
                            "new": {"code_dir": str(code), "data_dir": str(work), "sequence": verified["manifest"]["sequence"],
                            "schema_version": old["schema_version"], "release_id": verified["manifest"]["release_id"],
+                           "version": verified["manifest"]["version"],
                            "local_content_dir": str(private_state / "content"),
                            "local_config_dir": old.get("local_config_dir") or str(Path(old["code_dir"]) / "local_private")},
                            "backup_dir": str(backup), "manifest_sha256": verified["manifest_sha256"],

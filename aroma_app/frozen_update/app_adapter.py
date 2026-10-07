@@ -33,6 +33,30 @@ def attach(server_module, store, client):
     parent = server_module.Handler
     store.update_pending = False
     store.update_pending_operation = None
+
+    def merged_status(trusted):
+        # Notice metadata never supplies an apply grant or replaces the
+        # authenticated stable supervisor's operational state.
+        if not isinstance(trusted, dict):
+            raise ValueError('Invalid supervisor update status')
+        notice = store.update_checker().status(recovery_required=bool(store.recovery_pending()))
+        result = dict(notice)
+        result.update(trusted)
+        result.update({'state': notice['state'], 'automatic_check': True,
+            'automatic_install': False, 'metadata_only': False,
+            'notice_metadata_only': True,
+            'apply_enabled': bool(trusted.get('enabled') is True and trusted.get('apply_available') is True),
+            'current_version': trusted.get('active_version') or notice['current_version'],
+            'current_public_version': trusted.get('active_version') or notice['current_public_version'],
+            'current_schema': trusted.get('current_schema', notice['current_schema']),
+            'current_sequence': trusted.get('current_sequence', notice['current_sequence']),
+            'manual_apply_only': True})
+        if result['apply_enabled']:
+            result['apply_disabled_reason'] = None
+        elif notice['state'] not in ('incompatible', 'recovery_required'):
+            result['apply_disabled_reason'] = 'manual_check_required'
+        return result
+
     class UpdateHandler(parent):
         def _do_GET_serialized(self):
             path = urlsplit(self.path).path
@@ -54,8 +78,11 @@ def attach(server_module, store, client):
                     self.check_local()
                     route = "/status" if path == "/api/updates/status" else ('/requests/' if '/requests/' in path else '/operations/') + path.rsplit("/",1)[1]
                     result = client.request("GET",route)
+                    if route == '/status':
+                        result = merged_status(result)
                     if route=='/status' and self.store.recovery_pending():
-                        result.update({'enabled':False,'apply_available':False,'status':'work_recovery_required','recovery_required':True})
+                        result.update({'enabled':False,'apply_available':False,'apply_enabled':False,
+                            'status':'work_recovery_required','recovery_required':True})
                     if route=='/status': self.store.remote_update_enabled=result.get('enabled') is True
                     operation = result.get("operation") if route.startswith('/requests/') else result
                     if (self.store.update_pending and isinstance(operation, dict)
@@ -85,7 +112,8 @@ def attach(server_module, store, client):
                     token=self.headers.get('X-App-Token','')
                     if not token.isascii() or len(token)!=len(self.store.csrf_token) or not hmac.compare_digest(token,self.store.csrf_token):
                         raise server_module.AppError('Reopen the app and try again.',403,'session_expired')
-                    self.read_json();self.store.require_no_recovery()
+                    self.read_json();self.store.require_admin(self.headers.get('X-Admin-Token'))
+                    self.store.require_no_recovery()
                     if self.store.update_pending:raise server_module.AppError('Update is preparing.',409,'update_in_progress')
                     return self.json_response(client.request('POST','/check',{}))
                 except server_module.AppError as error:

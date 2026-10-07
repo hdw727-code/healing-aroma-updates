@@ -14,8 +14,27 @@ import update_client
 from app_adapter import HandoffClient, attach
 
 
+def preload_notice_verifier():
+    """Resolve metadata verifier only from the initial, reviewed installer.
+
+    Future ordinary app payloads cannot supply or replace this package. Avoid
+    adding the full initial app root as a fallback import path for app code.
+    """
+    package = TRUSTED.parent / 'startup_update_trusted'
+    entry = package / '__init__.py'
+    if (package.is_symlink() or package.is_junction() or entry.is_symlink() or
+            not entry.is_file() or entry.stat().st_nlink != 1):
+        raise ValueError('Initial update verifier package is unavailable')
+    spec = importlib.util.spec_from_file_location('startup_update_trusted', entry,
+        submodule_search_locations=[str(package)])
+    module = importlib.util.module_from_spec(spec)
+    sys.modules['startup_update_trusted'] = module
+    spec.loader.exec_module(module)
+
+
 def main():
     sys.stdout.reconfigure(encoding="utf8")
+    preload_notice_verifier()
     raw=sys.stdin.buffer.readline(1024*1024+1)
     if len(raw)>1024*1024: raise ValueError("Startup handoff is too large")
     launch=json.loads(raw)
@@ -47,10 +66,15 @@ def main():
     handler=attach(app,store,client)
     server=app.ThreadingHTTPServer(("127.0.0.1",launch["app_port"]),handler)
     server.store,server.verbose,server.daemon_threads=store,False,False
+    checker = store.update_checker()
+    checker.current_sequence = slot['sequence']
+    if launch.get('remote_updates_enabled') is True:
+        checker.start_check(recovery_required=bool(store.recovery_pending()))
     print(json.dumps({"event":"ready","port":server.server_port,"csrf_token":store.csrf_token,"version":app.APP_VERSION}),flush=True)
     try: server.serve_forever()
     finally:
         server.server_close()
+        checker.close()
         manager=getattr(store,"_ai_jobs_manager",None)
         if manager: manager.close()
         login=getattr(store,'_runtime_login_controller',None)

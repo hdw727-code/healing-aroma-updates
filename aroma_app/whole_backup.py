@@ -1,4 +1,4 @@
-"""Whole local work-data backup/restore prototype, standard library only.
+"""Whole local work-data backup/restore, standard library only.
 
 Server integration MUST serialize every imports/ai_jobs/exports write with
 store.lock and set a maintenance gate before restore (also wait for readers).
@@ -24,6 +24,8 @@ import zipfile
 
 from update_client import atomic_json, canonical, digest_file, read_json
 
+from commerce_schema import COMMERCE_SQL, COMMERCE_TABLES
+
 FORMAT = "aroma-full-work-backup"
 DATA_ROOTS = ("imports", "ai_jobs", "exports")
 CONTENT_ROOT = "business_content"
@@ -44,7 +46,7 @@ MAX_MANIFEST = 2 * 1024 * 1024
 BACKUP_NAME = re.compile(r"aroma_full_[0-9]{8}_[0-9]{6}_[a-f0-9]{12}\.zip\Z")
 HASH = re.compile(r"[a-f0-9]{64}\Z")
 TABLES = {"documents", "history", "requests", "settings", "imported_files", "imported_file_requests", "ai_jobs", "sqlite_sequence"}
-SCHEMA_SQL = """
+SCHEMA1_SQL = """
 CREATE TABLE documents(id TEXT PRIMARY KEY,kind TEXT NOT NULL,revision INTEGER NOT NULL,form_json TEXT NOT NULL,result_json TEXT NOT NULL,status TEXT NOT NULL,created_at TEXT NOT NULL,updated_at TEXT NOT NULL,content_json TEXT NOT NULL);
 CREATE TABLE history(document_id TEXT NOT NULL,revision INTEGER NOT NULL,form_json TEXT NOT NULL,result_json TEXT NOT NULL,status TEXT NOT NULL,created_at TEXT NOT NULL,content_json TEXT NOT NULL,PRIMARY KEY(document_id,revision));
 CREATE TABLE requests(request_id TEXT PRIMARY KEY,operation TEXT NOT NULL,payload_hash TEXT NOT NULL,response_json TEXT NOT NULL,created_at TEXT NOT NULL);
@@ -53,6 +55,9 @@ CREATE TABLE imported_files(id TEXT PRIMARY KEY,original_name TEXT NOT NULL,stor
 CREATE TABLE imported_file_requests(request_id TEXT PRIMARY KEY,file_id TEXT NOT NULL,original_name TEXT NOT NULL,size_bytes INTEGER NOT NULL,sha256 TEXT NOT NULL,FOREIGN KEY(file_id) REFERENCES imported_files(id));
 CREATE TABLE ai_jobs(id TEXT PRIMARY KEY,request_id TEXT UNIQUE NOT NULL,kind TEXT NOT NULL,preview_hash TEXT NOT NULL,snapshot_json TEXT NOT NULL,state TEXT NOT NULL,result_json TEXT NOT NULL,created_at TEXT NOT NULL,updated_at TEXT NOT NULL,message TEXT NOT NULL);
 """
+
+SCHEMA_SQL = SCHEMA1_SQL + COMMERCE_SQL
+TABLES = TABLES | set(COMMERCE_TABLES)
 
 
 def table_signature(conn, table):
@@ -116,7 +121,7 @@ def move_owned_directory(source, destination):
 
 
 class WholeBackup:
-    def __init__(self, store, *, schema_version=1, max_bytes=MAX_BYTES, max_files=MAX_FILES, fault_hook=None):
+    def __init__(self, store, *, schema_version=2, max_bytes=MAX_BYTES, max_files=MAX_FILES, fault_hook=None):
         self.store = store
         self.schema_version = schema_version
         self.max_bytes, self.max_files = max_bytes, max_files
@@ -356,7 +361,10 @@ class WholeBackup:
             error("schema_mismatch", "앱 자료 구조가 다른 백업입니다.")
         rows = conn.execute("SELECT type,name FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'").fetchall()
         tables = {r[1] for r in rows if r[0] == "table"}
-        if not {"documents", "history", "requests", "settings"}.issubset(tables) or not tables.issubset(TABLES):
+        allowed_tables = TABLES if self.schema_version == 2 else TABLES - set(COMMERCE_TABLES)
+        if self.schema_version == 2 and not COMMERCE_TABLES.issubset(tables):
+            error("database_schema", "schema2 접수 테이블이 빠져 있습니다.")
+        if not {"documents", "history", "requests", "settings"}.issubset(tables) or not tables.issubset(allowed_tables):
             error("database_schema", "지원하는 업무 데이터베이스가 아닙니다.")
         if any(row[0] in ("trigger", "view") for row in rows):
             error("database_schema", "실행 가능한 데이터베이스 구성을 거부했습니다.")
@@ -388,6 +396,7 @@ class WholeBackup:
 
     def create(self):
         with self.store.lock:
+            self.store.require_runtime_idle()
             if self.pending_recovery():
                 error("recovery_pending", "중단된 자료 복구를 확인한 뒤 새 백업을 만들어 주세요.", 409)
             self._active_ai()
@@ -413,6 +422,7 @@ class WholeBackup:
                 "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"), "members": all_rows,
                 "content_snapshot": {"names": list(CONTENT_NAMES), "present": [r["path"] for r in content_rows]},
                 "scope": {"database": True, "imports": True, "ai_jobs": True, "exports": True,
+                    "commerce_database": self.schema_version == 2, "sync_credentials": False,
                     "admin_pin": False, "auth_profile": False, "logs": False, "prior_backups": False,
                     "usb_originals": False, "local_program_content": True, "local_file_metadata": True,
                     "content_templates_files": False, "runtime_or_code": False}}
@@ -453,7 +463,7 @@ class WholeBackup:
         result = []
         for path in sorted(self.backups.glob("aroma_full_*.zip"), reverse=True):
             if not BACKUP_NAME.fullmatch(path.name) or not path.is_file() or path.is_symlink(): continue
-            version = None
+            version = schema = None
             try:
                 with zipfile.ZipFile(path) as archive:
                     info = archive.getinfo("manifest.json")
@@ -461,10 +471,12 @@ class WholeBackup:
                         value = read_json(archive.read(info))
                         if isinstance(value, dict) and value.get("format") == FORMAT and type(value.get("format_version")) is int:
                             version = value["format_version"]
+                            schema = value.get("schema_version") if type(value.get("schema_version")) is int else None
             except (OSError, ValueError, KeyError, zipfile.BadZipFile):
                 pass
             result.append({"name": path.name, "size_bytes": path.stat().st_size, "format": FORMAT,
-                "raw_files_included": True, "format_version": version,
+                "raw_files_included": True, "format_version": version, "schema_version": schema,
+                "conversion_required": schema == 1,
                 "local_program_content_included": version == 2, "local_file_metadata_included": version == 2,
                 "content_scope": "current_catalog_and_files_metadata" if version == 2 else "existing_content_preserved_on_restore"})
         return result
@@ -564,6 +576,7 @@ class WholeBackup:
             self.store.require_admin(admin_token)
             if self.pending_recovery():
                 error("recovery_pending", "중단된 자료 복구를 확인한 뒤 다른 백업을 복구해 주세요.", 409)
+            self.store.require_runtime_idle()
             self._active_ai()
             lock_path, lock_handle = self.backups / ".whole_restore.lock", None
             try:

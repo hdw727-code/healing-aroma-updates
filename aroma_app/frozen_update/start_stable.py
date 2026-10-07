@@ -11,11 +11,18 @@ from supervisor import StableSupervisor, SupervisorError
 from publisher_pin import load_publisher_pin
 from github_provider import GithubProvider
 
-CODE_PATHS={'server.py','app_start.py','local_import.py','ai_jobs.py','codex_bridge.py','quality.py',
+CODE_PATHS={'server.py','local_import.py','ai_jobs.py','codex_bridge.py','quality.py',
     'native_exports.py','ai_native_exports.py','whole_backup.py','backup_api.py','maintenance_gate.py',
     'update_client.py','native_signature.py','runtime_setup.py','runtime_login.py','image_adapter.py','png_exports.py',
     'public/update_ui.js','public/image_ui.js','public/app.js','public/index.html','public/styles.css','public/print.js',
-    'public/native_review.js','public/promo_png.js','public/full_backup_ui.js'}
+    'public/native_review.js','public/promo_png.js','public/full_backup_ui.js',
+    'commerce_schema.py','commerce_migration.py','commerce_store.py','commerce_sync.py',
+    'site_contract_adapter.py','commerce_http_transport.py','startup_updates.py',
+    'public/commerce_ui.js','public/commerce.css','public/update_notice.js'}
+
+INITIAL_SCHEMA = 2
+INITIAL_SEQUENCE = 3
+INITIAL_VERSION = '1.1.0'
 
 
 def main():
@@ -27,14 +34,16 @@ def main():
     parser.add_argument('--content-dir')
     parser.add_argument('--private-root')
     parser.add_argument('--examples-dir')
-    parser.add_argument('--port',type=int,default=8765)
+    parser.add_argument('--port',type=int,default=8766)
     args=parser.parse_args()
     install=Path(args.install_root).resolve()
     public_key=load_publisher_pin()
     supervisor=StableSupervisor(install/'update_state',python_exe=sys.executable,
         runtime_sha256=args.runtime_sha256,installation_root=install,app_port=args.port,
         examples_dir=args.examples_dir,code_paths=CODE_PATHS,pinned_public_key=public_key,
-        provider=GithubProvider() if public_key else None)
+        provider=GithubProvider() if public_key else None,
+        initial_schema=INITIAL_SCHEMA, initial_sequence=INITIAL_SEQUENCE,
+        initial_version=INITIAL_VERSION)
     try:
         # The public key is installed out of band. HTTP manifests cannot change
         # the publisher pin or the fixed provider repository.

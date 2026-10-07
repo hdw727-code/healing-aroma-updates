@@ -25,7 +25,7 @@ import uuid
 
 TRUSTED=Path(__file__).resolve().parent
 sys.path.insert(0,str(TRUSTED))
-from update_client import SideBySideUpdater, ManifestVerifier, PayloadPolicy, UpdateError, canonical, digest_file, read_json, atomic_json
+from update_client import SideBySideUpdater, ManifestVerifier, PayloadPolicy, UpdateError, canonical, digest_file, read_json, atomic_json, version_tuple, require_newer_version
 
 
 class SupervisorError(ValueError):
@@ -44,7 +44,13 @@ class OwnedProcess:
 class StableSupervisor:
     def __init__(self, state_root, *, python_exe, runtime_sha256, pinned_public_key=None,
                  app_port=8765, installation_root=None, examples_dir=None, grant_ttl=60,
-                 startup_timeout=10, stop_timeout=12, code_paths=None, provider=None):
+                 startup_timeout=10, stop_timeout=12, code_paths=None, provider=None,
+                 initial_schema=1, initial_sequence=0, initial_version=None):
+        if type(initial_schema) is not int or initial_schema < 1 or type(initial_sequence) is not int or initial_sequence < 0:
+            raise SupervisorError('initial_metadata', 'Invalid initial installation metadata.')
+        if initial_version is not None:
+            version_tuple(initial_version)
+        self.initial_schema, self.initial_sequence, self.initial_version = initial_schema, initial_sequence, initial_version
         self.root=Path(state_root).resolve();self.root.mkdir(parents=True,exist_ok=True)
         self.python=Path(python_exe).resolve()
         if not re.fullmatch(r"[a-f0-9]{64}",runtime_sha256) or digest_file(self.python)!=runtime_sha256:
@@ -55,6 +61,8 @@ class StableSupervisor:
         self.grant_ttl,self.startup_timeout,self.stop_timeout=grant_ttl,startup_timeout,stop_timeout
         self.secret=secrets.token_hex(32)
         self.current=None;self.owned=[];self.grants={};self.operations={};self.requests={};self.candidates={};self.release_versions={};self.launch_files={}
+        if initial_version is not None:
+            self.release_versions['initial'] = initial_version
         self.lock=threading.RLock();self.workers=[]
         self.provider,self.check_count,self.checking=provider,0,False
         self.verifier=None if pinned_public_key is None else ManifestVerifier(pinned_public_key,PayloadPolicy(code_paths=code_paths))
@@ -89,7 +97,9 @@ class StableSupervisor:
         except OSError:
             raise SupervisorError("initial_data_path", "Initial data directory could not be prepared.") from None
         slot={"code_dir":str(Path(code_dir).resolve()),"data_dir":str(initial_data),
-              "schema_version":1,"sequence":0,"release_id":"initial"}
+              "schema_version":self.initial_schema,"sequence":self.initial_sequence,"release_id":"initial"}
+        if self.initial_version is not None:
+            slot['version'] = self.initial_version
         if content_dir is not None:slot["local_content_dir"]=str(Path(content_dir).resolve())
         if private_root is not None:slot["local_config_dir"]=os.path.abspath(private_root) # No profile probe/read.
         # Only explicitly allowed existing code files are read. Never inventory
@@ -99,7 +109,8 @@ class StableSupervisor:
             if (Path(slot['code_dir'])/name).is_file()]
         atomic_json(self.root/'initial_slot.json',{'slot':slot,'verified_files':self.launch_files['initial'],'app_port':self.app_port})
         if self.updater:
-            self.updater.initialize(code_dir=slot["code_dir"],data_dir=slot["data_dir"])
+            self.updater.initialize(code_dir=slot["code_dir"],data_dir=slot["data_dir"],
+                schema_version=self.initial_schema, sequence=self.initial_sequence, version=self.initial_version)
             state=self.updater.status();state["active"].update(slot)
             atomic_json(self.updater.state_path,state)
         self.current=self.start(slot)
@@ -168,7 +179,9 @@ class StableSupervisor:
         """
         if self.verifier is None:raise SupervisorError("publisher_not_selected","No publisher key is configured.",503)
         state=self.updater.status()
-        verified=self.verifier.verify(envelope,current_sequence=state["highest_accepted_sequence"],current_schema=state["active"]["schema_version"])
+        verified=self.verifier.verify(envelope,current_sequence=state["highest_accepted_sequence"],
+            current_schema=state["active"]["schema_version"],
+            current_version=state['active'].get('version') or (self.current.version if self.initial_version is not None and self.current else None))
         candidate_id=uuid.uuid4().hex;folder=self.root/"candidates"/candidate_id;folder.mkdir(parents=True)
         (folder/"manifest.json").write_bytes(envelope)
         shutil.copyfile(archive_path,folder/"payload.zip")
@@ -193,13 +206,20 @@ class StableSupervisor:
         with self.lock:
             self._expire_waiting()
             configured=self.provider is not None and self.verifier is not None
+            current_sequence=self.current.slot['sequence'] if self.current else self.initial_sequence
+            apply_available=any(candidate['verified']['manifest']['sequence'] > current_sequence and
+                (self.initial_version is None or self.current is None or
+                 version_tuple(candidate['verified']['manifest']['version']) > version_tuple(self.current.version))
+                for candidate in self.candidates.values())
             return {"enabled":configured,"status":"ready_to_check" if configured else "provider_not_selected","supervisor_connected":True,
                     "manual_apply_only":True,"publisher_key_configured":self.verifier is not None,
                     "feed_selected":self.provider is not None,"external_fetch":self.check_count>0,"automatic_fetch":False,
-                    "apply_available":bool(self.candidates),
+                    "apply_available":apply_available,
                     "check_in_progress":self.checking,
                     "active_release_id":self.current.slot['release_id'] if self.current else None,
                     "active_version":self.current.version if self.current else None,
+                    "current_schema":self.current.slot['schema_version'] if self.current else self.initial_schema,
+                    "current_sequence":current_sequence,
                     "app_port":self.current.port if self.current and self.current.process.poll() is None else None,
                     "live_owned_process_count":sum(p.process.poll() is None for p in self.owned)}
 
@@ -214,6 +234,9 @@ class StableSupervisor:
             discovery=self.provider.discover()
             envelope,verified=self.provider.manifest(discovery,self.verifier,
                 current_sequence=state['highest_accepted_sequence'],current_schema=state['active']['schema_version'])
+            if self.initial_version is not None:
+                require_newer_version(verified['manifest']['version'],
+                    state['active'].get('version') or self.current.version)
             folder=self.root/'checks'/uuid.uuid4().hex;folder.mkdir(parents=True)
             archive=self.provider.download(verified,folder/'aroma-code.zip')
             candidate=self.register_local_candidate(envelope,archive)

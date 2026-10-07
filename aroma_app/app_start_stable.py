@@ -1,4 +1,4 @@
-"""Reviewable START_APP replacement hook; does not change the existing launcher."""
+"""1.1.0 launcher for its separate installation and loopback origin."""
 import argparse
 import hashlib
 import http.client
@@ -49,7 +49,7 @@ def main():
     parser.add_argument('--content-dir')
     parser.add_argument('--private-root')
     parser.add_argument('--examples-dir')
-    parser.add_argument('--port',type=int,default=8765)
+    parser.add_argument('--port',type=int,default=8766)
     parser.add_argument('--no-browser',action='store_true')
     parser.add_argument('--check',action='store_true')
     args=parser.parse_args()

@@ -1,7 +1,8 @@
 {
-  "version": "1.0.1",
-  "schema_version": 1,
-  "distribution": "public_review",
+  "version": "1.1.0",
+  "schema_version": 2,
+  "sequence": 3,
+  "distribution": "public_release",
   "business_materials_included": false,
   "recipient_pc_verified": false
 }

@@ -29,10 +29,14 @@ from local_import import ImportStore, LocalImportError
 from ai_jobs import AIJobManager, AIJobError
 from backup_api import FullBackupAPI
 from whole_backup import WholeBackupError
+from commerce_schema import initialize_or_migrate
+from commerce_store import CommerceStore, CommerceError
+from commerce_sync import CommerceSync
+from startup_updates import StartupUpdateChecker
 
 APP_ROOT = Path(__file__).resolve().parent
-SCHEMA_VERSION = 1
-APP_VERSION = "1.0.1"
+SCHEMA_VERSION = 2
+APP_VERSION = "1.1.0"
 MAX_BODY = 2 * 1024 * 1024
 MAX_MONEY = 1_000_000_000
 
@@ -231,7 +235,7 @@ def validate_plan(form):
 
 
 class AppStore:
-    def __init__(self, root=APP_ROOT, data_dir=None, content_dir=None, private_root=None, image_profile_dir=None, runtime_root=None):
+    def __init__(self, root=APP_ROOT, data_dir=None, content_dir=None, private_root=None, image_profile_dir=None, runtime_root=None, migration_confirmed=False, migration_fault_hook=None, commerce_transport=None, startup_update_factory=None):
         self.root = Path(root).resolve()
         # Stable launcher constructor only; no HTTP path or profile contents.
         self.runtime_root = Path(runtime_root).resolve() if runtime_root is not None else self.root
@@ -241,12 +245,28 @@ class AppStore:
         # Trusted constructor reference only. No profile probe, copy, or HTTP path input.
         self.image_profile_dir = Path(os.path.abspath(image_profile_dir)) if image_profile_dir is not None else None
         self.data_dir = Path(data_dir).resolve() if data_dir else self.root / "user_data"
+        # Paths are selected only by the installed trusted launcher. HTTP
+        # requests cannot override data, content, runtime or profile locations.
+        # Older live databases are never migrated by startup; use the explicit
+        # portable backup import/conversion flow in a separate installation.
+        if migration_confirmed is not False:
+            raise AppError("이전 자료는 전체백업 ZIP으로 가져와 주세요.", 422, "schema1_import_required")
+        self.migration_confirmed = False
+        self.migration_fault_hook = migration_fault_hook
+        self._commerce_transport = commerce_transport
+        self._startup_update_factory = startup_update_factory
+        for chosen in (self.root, self.data_dir, self.content_dir, self.private_root):
+            for parent in (Path(chosen), *Path(chosen).parents):
+                if parent.is_symlink() or parent.is_junction():
+                    raise AppError("연결된 폴더 경로는 먼저 확인해 주세요.", 403, "local_path_link")
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.backup_dir = self.data_dir / "backups"
         self.export_dir = self.data_dir / "exports"
         self.backup_dir.mkdir(exist_ok=True)
         self.export_dir.mkdir(exist_ok=True)
         self.db_path = self.data_dir / "office.sqlite3"
+        if self.db_path.is_symlink() or self.db_path.is_junction() or (self.db_path.exists() and self.db_path.stat().st_nlink != 1):
+            raise AppError("연결된 DB 파일은 경로를 먼저 확인해 주세요.",403,"local_path_link")
         self.lock = threading.RLock()
         self.csrf_token = secrets.token_urlsafe(32)
         self.admin_sessions = {}
@@ -258,6 +278,19 @@ class AppStore:
         self._startup_recovery_mode = bool(self.recovery_pending())
         if not self._startup_recovery_mode:
             self._initialize()
+
+    def update_checker(self):
+        # Public metadata checker only: no trusted supervisor/installer attach.
+        with self.lock:
+            checker = getattr(self, "_startup_update_checker", None)
+            if checker is None:
+                options = {} if self._startup_update_factory is None else {"backend_factory": self._startup_update_factory}
+                checker = StartupUpdateChecker(current_version=APP_VERSION, current_schema=SCHEMA_VERSION, **options)
+                self._startup_update_checker = checker
+            return checker
+
+    def update_status(self):
+        return self.update_checker().status(recovery_required=bool(self.recovery_pending()))
 
     @contextmanager
     def restore_maintenance(self):
@@ -287,6 +320,9 @@ class AppStore:
     def require_runtime_idle(self):
         # Do not instantiate a controller, inspect credentials, or start login.
         # Runtime setup is asynchronous even while HTTP requests hold our lock.
+        sync = getattr(self, "_commerce_sync_manager", None)
+        if sync:
+            sync.require_idle()
         controller = getattr(self, "_runtime_login_controller", None)
         if controller and controller.status().get("state") in ("starting", "waiting_user", "cancelling"):
             raise AppError("공식 로그인 작업이 진행 중입니다. 완료하거나 취소한 뒤 다시 시도해 주세요.",
@@ -307,30 +343,21 @@ class AppStore:
             connection.close()
 
     def _initialize(self):
-        with self.lock, self.connect() as conn:
-            version = conn.execute("PRAGMA user_version").fetchone()[0]
-            if version > SCHEMA_VERSION:
-                raise RuntimeError("이 데이터는 더 새 버전의 앱에서 만들어졌습니다. 앱 업데이트를 확인해 주세요.")
-            if version and version < SCHEMA_VERSION:
-                destination = self.backup_dir / f"before_migration_{int(time.time())}.sqlite3"
-                with closing(sqlite3.connect(destination)) as backup:
-                    conn.backup(backup)
-            conn.executescript("""
-                CREATE TABLE IF NOT EXISTS documents (
-                  id TEXT PRIMARY KEY, kind TEXT NOT NULL, revision INTEGER NOT NULL,
-                  form_json TEXT NOT NULL, result_json TEXT NOT NULL, status TEXT NOT NULL,
-                  created_at TEXT NOT NULL, updated_at TEXT NOT NULL, content_json TEXT NOT NULL);
-                CREATE TABLE IF NOT EXISTS history (
-                  document_id TEXT NOT NULL, revision INTEGER NOT NULL, form_json TEXT NOT NULL,
-                  result_json TEXT NOT NULL, status TEXT NOT NULL, created_at TEXT NOT NULL,
-                  content_json TEXT NOT NULL, PRIMARY KEY(document_id,revision));
-                CREATE TABLE IF NOT EXISTS requests (
-                  request_id TEXT PRIMARY KEY, operation TEXT NOT NULL, payload_hash TEXT NOT NULL,
-                  response_json TEXT NOT NULL, created_at TEXT NOT NULL);
-                CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value_json TEXT NOT NULL);
-            """)
-            conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
-            conn.execute("PRAGMA journal_mode = WAL")
+        self.migration_result = initialize_or_migrate(self, """CREATE TABLE documents (id TEXT PRIMARY KEY,kind TEXT NOT NULL,revision INTEGER NOT NULL,form_json TEXT NOT NULL,result_json TEXT NOT NULL,status TEXT NOT NULL,created_at TEXT NOT NULL,updated_at TEXT NOT NULL,content_json TEXT NOT NULL);
+CREATE TABLE history (document_id TEXT NOT NULL,revision INTEGER NOT NULL,form_json TEXT NOT NULL,result_json TEXT NOT NULL,status TEXT NOT NULL,created_at TEXT NOT NULL,content_json TEXT NOT NULL,PRIMARY KEY(document_id,revision));
+CREATE TABLE requests (request_id TEXT PRIMARY KEY,operation TEXT NOT NULL,payload_hash TEXT NOT NULL,response_json TEXT NOT NULL,created_at TEXT NOT NULL);
+CREATE TABLE settings (key TEXT PRIMARY KEY,value_json TEXT NOT NULL);""",
+            confirmed=self.migration_confirmed, fault_hook=self.migration_fault_hook)
+
+    def commerce_store(self):
+        return CommerceStore(self)
+
+    def commerce_sync(self):
+        manager = getattr(self, "_commerce_sync_manager", None)
+        if manager is None:
+            manager = CommerceSync(self, self._commerce_transport)
+            self._commerce_sync_manager = manager
+        return manager
 
     def content(self):
         result = {}
@@ -368,26 +395,30 @@ class AppStore:
         full = self.full_backup_api().status()
         if full["pending_recovery"]:
             # Do not instantiate importer/AI manager or expose mixed work rows.
-            return {"programs": [], "files": [], "quotes": [], "plans": [], "ai_jobs": [],
+            return {"version": APP_VERSION, "programs": [], "files": [], "quotes": [], "plans": [], "ai_jobs": [],
                 "csrf_token": self.csrf_token, "full_backup": full, "recovery_required": True,
+                "updates": self.update_checker().status(recovery_required=True),
                 "settings": {"schema_version": SCHEMA_VERSION, "admin_configured": self.admin_configured(),
                     "storage": "local_only", "remote_update_enabled": False},
                 "connection": {"mode": "template", "status": "recovery_required", "ai_used": False},
                 "ai_connection": {"status": "recovery_required", "auth": "not_checked"}}
         content = self.content()
         importer = self.import_store()
-        content["files"] = content["files"] + importer.list_files()
-        return {**content, "full_backup": full, "recovery_required": False,
+        # Contact-bearing documents/import names are fetched only after PIN.
+        content["files"] = []
+        return {**content, "version": APP_VERSION, "full_backup": full, "recovery_required": False,
+                "updates": self.update_checker().status(),
+                "commerce": self.commerce_store().status(),
                 "png_server_storage_ready": True, "native_ready": self.native_ready(),
                 "native_capabilities": {"formats": {"ppt": "pptx", "report": "docx"},
                     "review_required": True, "full_response": True, "additional_model_call": False},
                 "file_import_limits": importer.limits(), "ai_connection": self.ai_manager().status(),
-                "ai_jobs": self.ai_manager().list_jobs(), "settings": {"schema_version": SCHEMA_VERSION,
+                "ai_jobs": [], "settings": {"schema_version": SCHEMA_VERSION,
                     "business_name": content["catalog_meta"].get("business_name", "아로마 업무"),
                     "data_folder": str(self.data_dir), "export_folder": str(self.export_dir),
                     "backup_folder": str(self.backup_dir), "admin_configured": self.admin_configured(),
                     "storage": "local_only", "remote_update_enabled": bool(getattr(self, "remote_update_enabled", False))},
-                "quotes": self.list_documents("quotes"), "plans": self.list_documents("plans"),
+                "quotes": [], "plans": [],
                 "backups": self.list_backups(), "csrf_token": self.csrf_token,
                 "connection": {"mode": "template", "status": "not_connected", "ai_used": False,
                     "message": "현재는 저장된 서식으로 작성합니다. 실제 AI와 외부 서비스는 연결되지 않았습니다."}}
@@ -892,6 +923,8 @@ class AppStore:
 
     def create_backup(self):
         with self.lock:
+            self.require_runtime_idle()
+            self.require_no_recovery()
             name = f"aroma_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{secrets.token_hex(3)}.zip"
             temporary = self.backup_dir / f".{name}.sqlite3"
             try:
@@ -903,7 +936,7 @@ class AppStore:
                     target.execute("VACUUM")
                 manifest = {"schema_version": SCHEMA_VERSION, "created_at": now(),
                             "database_sha256": hashlib.sha256(temporary.read_bytes()).hexdigest(),
-                            "scope": "documents_and_local_settings", "admin_pin_included": False,
+                            "scope": "documents_and_local_settings", "admin_pin_included": False, "commerce_database_included":True, "sync_credentials_included":False,
                             "import_index_included_if_present": True, "import_raw_files_included": False,
                             "imports_backup_note": "이 ZIP은 자료 색인만 포함합니다. imports 폴더의 실제 사본은 별도 저장장치에 따로 백업하세요.",
                             "ai_job_index_included_if_present": True, "ai_result_files_included": False,
@@ -936,6 +969,7 @@ class AppStore:
             raise AppError("백업 파일을 찾지 못했습니다.", 404, "not_found")
         temporary = self.data_dir / f"restore_{secrets.token_hex(8)}.sqlite3"
         with self.lock:
+            self.require_runtime_idle()
             # The check and restoration share the same lock used by job start.
             manager = getattr(self, "_ai_jobs_manager", None)
             if manager and any(job["state"] in AIJobManager.ACTIVE for job in manager.list_jobs()):
@@ -960,6 +994,7 @@ class AppStore:
                         raise AppError("백업 데이터를 확인하지 못했습니다. 다른 백업을 선택해 주세요.")
                     if check.execute("PRAGMA user_version").fetchone()[0] != SCHEMA_VERSION:
                         raise AppError("백업 데이터 버전이 맞지 않습니다.")
+                    self.full_backup_api().service._check_db(check, require_no_pin=True)
                     actual_tables = {row[0] for row in check.execute("SELECT name FROM sqlite_master WHERE type='table'")}
                     if not {"documents", "history", "requests", "settings"}.issubset(actual_tables):
                         raise AppError("백업의 업무 자료를 찾지 못했습니다.")
@@ -1094,11 +1129,16 @@ class Handler(BaseHTTPRequestHandler):
         # the useful 403 response. Drain only bounded JSON, never large file input.
         if getattr(self, "_json_body_consumed", False):
             return
-        if self.headers.get("Content-Type", "").split(";")[0].strip().lower() != "application/json" or self.headers.get("Transfer-Encoding"):
+        body_type = self.headers.get("Content-Type", "").split(";")[0].strip().lower()
+        if body_type not in ("application/json", "application/octet-stream") or self.headers.get("Transfer-Encoding"):
             return
         try:
             length = int(self.headers.get("Content-Length", "0"))
-            if not 0 <= length <= MAX_BODY:
+            # Unauthorized uploads never parse/save anything. Only a small
+            # already-sent body is drained to return a reliable Windows 401;
+            # reject and close large/unbounded uploads without reading them.
+            drain_limit = 65536 if body_type == "application/octet-stream" else MAX_BODY
+            if not 0 <= length <= drain_limit:
                 return
             self.connection.settimeout(0.2)
             self.rfile.read(length)
@@ -1121,6 +1161,18 @@ class Handler(BaseHTTPRequestHandler):
             if (path.startswith("/api/") or path.startswith("/exports/")) and path not in (
                     "/api/health", "/api/bootstrap", "/api/admin/status", "/api/backups/full", "/api/updates/status"):
                 self.store.require_no_recovery()
+            if path == "/api/commerce/status":
+                return self.json_response({**self.store.commerce_store().status(), "sync":self.store.commerce_sync().status()})
+            if path in ("/api/commerce/requests", "/api/commerce/catalog", "/api/commerce/slots", "/api/commerce/sync"):
+                self.store.require_admin(self.headers.get("X-Admin-Token"))
+                method, key = {"/api/commerce/requests":(self.store.commerce_store().list_requests,"requests"),
+                    "/api/commerce/catalog":(self.store.commerce_store().catalog,"items"),
+                    "/api/commerce/slots":(self.store.commerce_store().slots,"slots"),
+                    "/api/commerce/sync":(self.store.commerce_sync().status,"sync")}[path]
+                return self.json_response({key:method()})
+            if (path.startswith(("/api/quotes", "/api/plans", "/api/files", "/api/ai/jobs", "/exports/"))
+                    or re.fullmatch(r"/api/backups/(?:full/)?[^/]+/download",path)):
+                self.store.require_admin(self.headers.get("X-Admin-Token"))
             if path == "/api/health":
                 return self.json_response({"app_id": "aroma-work-helper", "instance_root": str(self.store.root),
                     "version": APP_VERSION, "schema_version": SCHEMA_VERSION, "storage": "local_only"})
@@ -1129,8 +1181,7 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/backups/full":
                 return self.json_response(self.store.full_backup_api().status())
             if path == "/api/updates/status":
-                return self.json_response({"enabled": False, "status": "provider_not_selected", "manual_apply_only": True,
-                    "publisher_key_configured": False, "supervisor_connected": False, "external_fetch": False})
+                return self.json_response(self.store.update_status())
             full_match = re.fullmatch(r"/api/backups/full/(aroma_full_[A-Za-z0-9_]+\.zip)/download", path)
             if full_match:
                 file = self.store.full_backup_api().download(full_match.group(1))
@@ -1236,14 +1287,39 @@ class Handler(BaseHTTPRequestHandler):
             self.send_bytes(file_path.read_bytes(), content_type=types[file_path.suffix.lower()])
         except WholeBackupError as error:
             self.error_response(AppError(error.message, error.status, error.code))
-        except (AppError, LocalImportError, AIJobError) as error:
+        except (AppError, LocalImportError, AIJobError, CommerceError) as error:
             self.error_response(error)
         except (OSError, sqlite3.Error, ValueError) as error:
             self.error_response(AppError("자료를 읽지 못했습니다. 앱을 다시 열어 주세요. 저장 자료는 그대로 남아 있습니다.", 500, "storage_error"))
 
     def do_POST(self):
+        if urlsplit(self.path).path == "/api/commerce/sync":
+            return self._commerce_sync_POST()
         with self.store.lock:
             self._do_POST_serialized()
+
+    def _commerce_sync_POST(self):
+        self._json_body_consumed=False
+        try:
+            with self.store.lock:
+                self.check_local()
+                token=self.headers.get("X-App-Token", "")
+                if not token.isascii() or len(token)!=len(self.store.csrf_token) or not hmac.compare_digest(token,self.store.csrf_token):
+                    self.close_connection=True
+                    raise AppError("앱을 다시 열어 주세요.",403,"session_expired")
+                self.store.require_admin(self.headers.get("X-Admin-Token"))
+                self.store.require_no_recovery()
+                payload=self.read_json()
+                manager=self.store.commerce_sync()
+            return self.json_response(manager.run(payload))
+        except (AppError, CommerceError) as error:
+            self.drain_rejected_json()
+            self.error_response(error)
+        except WholeBackupError as error:
+            self.drain_rejected_json()
+            self.error_response(AppError(error.message,error.status,error.code))
+        except (OSError, sqlite3.Error, ValueError):
+            self.error_response(AppError("동기화를 완료하지 못했습니다. 자료는 보존되어 있습니다.",500,"commerce_sync_failed"))
 
     def _do_POST_serialized(self):
         self._json_body_consumed = False
@@ -1256,6 +1332,28 @@ class Handler(BaseHTTPRequestHandler):
             path = urlsplit(self.path).path
             if path not in ("/api/admin/login", "/api/backups/full/recover", "/api/shutdown"):
                 self.store.require_no_recovery()
+            if path in ("/api/backups/full/import", "/api/backups/full/convert-schema1", "/api/quotes/save", "/api/plans/save", "/api/files/upload",
+                        "/api/studio/draft", "/api/studio/export", "/api/studio/png") or re.fullmatch(
+                    r"/api/(quotes|plans)/[A-Za-z0-9_-]+/(undo|export)", path):
+                self.store.require_admin(self.headers.get("X-Admin-Token"))
+            if path == "/api/backups/full/import":
+                if self.headers.get("Transfer-Encoding"):
+                    raise AppError("파일 전송 형식을 확인해 주세요.", 400, "binary_required")
+                if self.headers.get("Content-Type", "").split(";")[0].strip().lower() != "application/octet-stream":
+                    raise AppError("전체백업 ZIP 파일을 선택해 주세요.", 415, "binary_required")
+                length = self.headers.get("Content-Length", "")
+                if not re.fullmatch(r"[0-9]{1,12}", length):
+                    raise AppError("파일 전송 크기를 확인해 주세요.", 400, "archive_limit")
+                encoded_name = self.headers.get("X-File-Name", "")
+                if len(encoded_name) > 3072:
+                    raise AppError("파일 이름이 너무 깁니다.", 400, "backup_name")
+                try:
+                    name = unquote(encoded_name, encoding="utf-8", errors="strict")
+                except UnicodeDecodeError:
+                    raise AppError("파일 이름을 확인해 주세요.", 400, "backup_name") from None
+                self.close_connection = True
+                return self.json_response(self.store.full_backup_api().import_stream(
+                    self.rfile, int(length), name, self.headers.get("X-Admin-Token")))
             if path == "/api/files/upload":
                 if self.headers.get("Transfer-Encoding"):
                     raise AppError("파일 전송 형식을 확인해 주세요.")
@@ -1274,6 +1372,24 @@ class Handler(BaseHTTPRequestHandler):
                     self.headers.get("X-Request-Id"), self.headers.get("X-File-Modified"))
                 return self.json_response(result)
             payload = self.read_json(body_limit=8 * 1024 * 1024 if path == "/api/studio/png" else MAX_BODY)
+            if path in ("/api/updates/check", "/api/updates/notice/check"):
+                if payload:
+                    raise AppError("Update checks accept no customer fields or channel overrides.", 400, "update_check_fields")
+                result = self.store.update_checker().start_check()
+                return self.json_response(result, status=202)
+            if path == "/api/updates/apply":
+                self.store.require_admin(self.headers.get("X-Admin-Token"))
+                # The frozen installed handler intercepts this path. A directly
+                # launched server has no authority to replace installed code.
+                raise AppError("설치본의 업데이트 메뉴에서 적용해 주세요.",
+                               409, "supervisor_not_attached")
+            if path in ("/api/commerce/catalog", "/api/commerce/slots", "/api/commerce/requests", "/api/commerce/requests/review"):
+                self.store.require_admin(self.headers.get("X-Admin-Token"))
+                method={"/api/commerce/catalog":self.store.commerce_store().save_offering,
+                    "/api/commerce/slots":self.store.commerce_store().save_slot,
+                    "/api/commerce/requests":self.store.commerce_store().save_request,
+                    "/api/commerce/requests/review":self.store.commerce_store().review}[path]
+                return self.json_response(method(payload))
             if path == "/api/studio/png":
                 from png_exports import PngExportError, save_studio_png
                 try:
@@ -1306,6 +1422,7 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/shutdown":
                 if payload.get("confirm") is not True:
                     raise AppError("앱을 종료하려면 확인 버튼을 눌러 주세요.", 422, "confirmation_required")
+                self.store.commerce_sync().require_idle()
                 self.json_response({"shutdown": True, "data_deleted": False,
                     "message": "업무 앱을 종료합니다. 저장 자료는 그대로 남아 있습니다."})
                 self.wfile.flush()
@@ -1359,11 +1476,15 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/backups/full/create":
                 self.store.require_runtime_idle()
                 return self.json_response(self.store.full_backup_api().create())
+            if path == "/api/backups/full/convert-schema1":
+                return self.json_response(self.store.full_backup_api().convert_schema1(
+                    payload, self.headers.get("X-Admin-Token")))
             if path == "/api/backups/full/restore":
                 return self.json_response(self.store.full_backup_api().restore(payload, self.headers.get("X-Admin-Token")))
             if path == "/api/backups/full/recover":
                 return self.json_response(self.store.full_backup_api().recover(payload, self.headers.get("X-Admin-Token")))
             if path == "/api/backups/restore":
+                self.store.require_admin(self.headers.get("X-Admin-Token"))
                 self.store.require_runtime_idle()
                 return self.json_response(self.store.restore_backup(payload))
             if path == "/api/admin/setup":
@@ -1384,21 +1505,24 @@ class Handler(BaseHTTPRequestHandler):
         except WholeBackupError as error:
             self.drain_rejected_json()
             self.error_response(AppError(error.message, error.status, error.code))
-        except (AppError, LocalImportError, AIJobError) as error:
+        except (AppError, LocalImportError, AIJobError, CommerceError) as error:
             self.drain_rejected_json()
             self.error_response(error)
         except (OSError, sqlite3.Error, ValueError, ImportError) as error:
             self.error_response(AppError("저장하지 못했습니다. 입력 내용을 그대로 두고 다시 저장해 주세요.", 500, "storage_error"))
 
 
-def create_server(root=APP_ROOT, port=8765, data_dir=None, verbose=False, content_dir=None, private_root=None, image_profile_dir=None, runtime_root=None):
-    store = AppStore(root, data_dir, content_dir=content_dir, private_root=private_root, image_profile_dir=image_profile_dir, runtime_root=runtime_root)
+def create_server(root=APP_ROOT, port=8765, data_dir=None, verbose=False, content_dir=None, private_root=None, image_profile_dir=None, runtime_root=None, startup_updates=True, startup_update_factory=None):
+    store = AppStore(root, data_dir, content_dir=content_dir, private_root=private_root, image_profile_dir=image_profile_dir, runtime_root=runtime_root,
+                     startup_update_factory=startup_update_factory)
     server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
     # Completed shutdown waits for active saves, rather than abandoning them.
     # Each response closes its connection so idle browser sockets do not delay exit.
     server.daemon_threads = False
     server.store = store
     server.verbose = verbose
+    if startup_updates:
+        store.update_checker().start_check(recovery_required=bool(store.recovery_pending()))
     return server
 
 
@@ -1420,6 +1544,9 @@ def main():
     except KeyboardInterrupt:
         pass
     finally:
+        checker = getattr(server.store, "_startup_update_checker", None)
+        if checker:
+            checker.close()
         server.server_close()
         manager = getattr(server.store, "_ai_jobs_manager", None)
         if manager:
